@@ -1,0 +1,74 @@
+name: Medir tamanho da ROM base
+
+on:
+  workflow_dispatch:
+    inputs:
+      rom_url:
+        description: "Link direto do zip da ROM global (o que contem payload.bin)"
+        required: true
+        type: string
+
+jobs:
+  medir:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      ROM_URL: ${{ inputs.rom_url }}
+    steps:
+      - name: Liberar espaco no runner
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Baixar a ROM
+        run: |
+          mkdir -p work out
+          curl -L --fail --retry 5 --retry-delay 5 -o work/rom.zip "$ROM_URL"
+          ls -lh work/rom.zip
+
+      - name: Extrair o payload.bin
+        run: |
+          unzip -o work/rom.zip payload.bin -d work
+          rm -f work/rom.zip
+          ls -lh work/payload.bin
+
+      - name: Instalar o payload-dumper-go
+        run: |
+          go install github.com/ssut/payload-dumper-go@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Extrair as imagens
+        run: |
+          payload-dumper-go -o out work/payload.bin
+          ls -lh out || true
+          find out -name '*.img' -exec mv {} out/ \; 2>/dev/null || true
+
+      - name: Gerar o relatorio de tamanhos
+        run: |
+          fs_of() {
+            e=$(od -An -tx1 -j1024 -N4 "$1" 2>/dev/null | tr -d ' \n')
+            x=$(od -An -tx1 -j1080 -N2 "$1" 2>/dev/null | tr -d ' \n')
+            if [ "$e" = "e2e1f5e0" ]; then echo "EROFS"
+            elif [ "$x" = "53ef" ]; then echo "ext4"
+            else echo "outro"; fi
+          }
+          {
+            echo "## Tamanho das imagens da ROM base"
+            echo ""
+            echo "| Imagem | Sistema de arquivos | MiB | Bytes |"
+            echo "|---|---|---|---|"
+            for f in out/*.img; do
+              [ -f "$f" ] || continue
+              b=$(stat -c %s "$f")
+              echo "| $(basename "$f") | $(fs_of "$f") | $((b/1048576)) | $b |"
+            done
+            total=0
+            for n in system system_ext product mi_ext; do
+              if [ -f "out/$n.img" ]; then
+                total=$((total + $(stat -c %s "out/$n.img")))
+              fi
+            done
+            echo ""
+            echo "**system + system_ext + product + mi_ext:** $((total/1048576)) MiB ($total bytes)"
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$GITHUB_STEP_SUMMARY"
