@@ -11,7 +11,7 @@ on:
 jobs:
   medir:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 240
     env:
       ROM_URL: ${{ inputs.rom_url }}
     steps:
@@ -22,8 +22,13 @@ jobs:
 
       - name: Baixar a ROM
         run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aria2
           mkdir -p work out
-          curl -L --fail --retry 5 --retry-delay 5 -o work/rom.zip "$ROM_URL"
+          aria2c -x 16 -s 16 -k 8M --file-allocation=none \
+            --max-tries=10 --retry-wait=5 \
+            --summary-interval=60 --console-log-level=warn \
+            -d work -o rom.zip "$ROM_URL"
           ls -lh work/rom.zip
 
       - name: Extrair o payload.bin
