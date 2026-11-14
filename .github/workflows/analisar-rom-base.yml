@@ -1,1 +1,76 @@
+name: Analisar conteudo da ROM base
 
+on:
+  workflow_dispatch:
+    inputs:
+      rom_url:
+        description: "Link direto do zip da ROM global (o que contem payload.bin)"
+        required: true
+        type: string
+
+jobs:
+  analisar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      ROM_URL: ${{ inputs.rom_url }}
+    steps:
+      - name: Liberar espaco no runner
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Instalar ferramentas
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aria2 erofs-utils
+          go install github.com/ssut/payload-dumper-go@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Baixar a ROM
+        run: |
+          mkdir -p work out
+          aria2c -x 16 -s 16 -k 8M --file-allocation=none \
+            --max-tries=10 --retry-wait=5 \
+            --summary-interval=60 --console-log-level=warn \
+            -d work -o rom.zip "$ROM_URL"
+
+      - name: Extrair o payload e as imagens
+        run: |
+          unzip -o work/rom.zip payload.bin -d work
+          rm -f work/rom.zip
+          payload-dumper-go -p system,system_ext,product,mi_ext -o out work/payload.bin
+          find out -name '*.img' -exec mv {} out/ \; 2>/dev/null || true
+          rm -f work/payload.bin
+          ls -lh out
+
+      - name: Extrair o conteudo das imagens
+        run: |
+          mkdir -p tree
+          for n in system system_ext product mi_ext; do
+            mkdir -p "tree/$n"
+            fsck.erofs --extract="tree/$n" "out/$n.img" || echo "falha ao extrair $n"
+          done
+          du -sm tree/*
+          df -h /
+
+      - name: Gerar o relatorio
+        run: |
+          {
+            echo "## Conteudo da ROM base"
+            echo ""
+            echo "| Imagem | EROFS (MiB) | Descompactado (MiB) |"
+            echo "|---|---|---|"
+            for n in system system_ext product mi_ext; do
+              a=$(( $(stat -c %s "out/$n.img") / 1048576 ))
+              b=$(du -sm "tree/$n" | cut -f1)
+              echo "| $n | $a | $b |"
+            done
+            for n in system system_ext product mi_ext; do
+              echo ""
+              echo "### $n: 40 maiores pastas (ate 3 niveis, MiB descompactado)"
+              echo '```'
+              (cd "tree/$n" && du -m --max-depth=3 . | sort -rn | head -40)
+              echo '```'
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
