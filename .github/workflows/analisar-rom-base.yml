@@ -23,7 +23,7 @@ jobs:
       - name: Instalar ferramentas
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq aria2 erofs-utils
+          sudo apt-get install -y -qq aria2 erofs-utils aapt
           go install github.com/ssut/payload-dumper-go@latest
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
@@ -73,4 +73,23 @@ jobs:
               (cd "tree/$n" && du -m --max-depth=3 . | sort -rn | head -40)
               echo '```'
             done
+            echo ""
+            echo "### Apps de telefone, contatos, mensagens, agenda e gravador"
+            echo '```'
+            find tree -name '*.apk' -printf '%h\n' | sed 's|^tree/||' | sort -u \
+              | grep -iE 'contact|dialer|mms|messag|calendar|phone|telecom|record|incall' || echo "nenhum encontrado"
+            echo '```'
+            echo ""
+            echo "### Portugues (pt-BR) nos apps principais"
+            echo '```'
+            find tree -name '*.apk' \
+              | grep -iE 'framework-res|framework-ext-res|/Settings/|MiuiSystemUI|contact|dialer|mms|recorder|incall' \
+              | sort | while read -r apk; do
+                loc=$(aapt dump badging "$apk" 2>/dev/null | grep -m1 '^locales:')
+                if [ -z "$loc" ]; then r="sem info"
+                elif echo "$loc" | grep -qE "pt[-_]?r?BR"; then r="pt-BR: SIM"
+                else r="pt-BR: NAO"; fi
+                echo "$r  ${apk#tree/}"
+              done
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
