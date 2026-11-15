@@ -1,0 +1,373 @@
+name: Montar pacote do port
+
+on:
+  workflow_dispatch:
+    inputs:
+      rom_url:
+        description: "Link direto do zip da ROM base (creek, Indonesia, com payload.bin)"
+        required: true
+        type: string
+      drive_id:
+        description: "ID do zip do GSI no Google Drive (de onde vem vendor, boot, dtbo e vbmeta)"
+        required: true
+        default: "1zETh1vs-MbizeUNVwYNW3IJKLjW6jWhb"
+        type: string
+      vendor_sdk:
+        description: "SDK que o vendor declara (37 = mantem como esta)"
+        required: true
+        default: "37"
+        type: string
+
+jobs:
+  montar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      ROM_URL: ${{ inputs.rom_url }}
+      DRIVE_ID: ${{ inputs.drive_id }}
+      VENDOR_SDK: ${{ inputs.vendor_sdk }}
+    steps:
+      - name: Liberar espaco no runner
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Instalar ferramentas
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aria2 erofs-utils zip unzip e2fsprogs android-sdk-libsparse-utils python3-pip git lz4 cpio file binutils
+          pip install --break-system-packages gdown
+          go install github.com/ssut/payload-dumper-go@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          git clone --depth 1 https://android.googlesource.com/platform/system/tools/mkbootimg tools
+
+      - name: Baixar a ROM base
+        run: |
+          mkdir -p work out
+          aria2c -x 16 -s 16 -k 8M --file-allocation=none \
+            --max-tries=10 --retry-wait=5 \
+            --summary-interval=60 --console-log-level=warn \
+            -d work -o rom.zip "$ROM_URL"
+          size=$(stat -c %s work/rom.zip)
+          if [ "$size" -lt 1000000000 ]; then
+            echo "ERRO: o arquivo baixado tem so $size bytes, nao e a ROM."
+            head -c 600 work/rom.zip
+            exit 1
+          fi
+
+      - name: Extrair o payload e as imagens
+        run: |
+          unzip -o work/rom.zip payload.bin -d work
+          rm -f work/rom.zip
+          payload-dumper-go -p system,system_ext,product,mi_ext -o out work/payload.bin
+          find out -name '*.img' -exec mv {} out/ \; 2>/dev/null || true
+          rm -f work/payload.bin
+          ls -lh out
+
+      - name: Extrair o conteudo das imagens
+        run: |
+          mkdir -p tree
+          for n in system system_ext product mi_ext; do
+            mkdir -p "tree/$n"
+            sudo fsck.erofs --extract="tree/$n" --preserve "out/$n.img" \
+              || sudo fsck.erofs --extract="tree/$n" "out/$n.img"
+          done
+          rm -f out/*.img
+          sudo du -sm tree/*
+
+      - name: Remover os apps escolhidos
+        run: |
+          : > removidos.txt
+          remover() {
+            if [ -e "tree/$1" ]; then
+              sz=$(sudo du -sm "tree/$1" | cut -f1)
+              sudo rm -rf "tree/$1"
+              echo "removido: $1 (${sz} MiB)" | tee -a removidos.txt
+            else
+              echo "NAO ENCONTRADO: $1" | tee -a removidos.txt
+            fi
+          }
+          for a in Photos Gmail2 YouTube Maps Meet YTMusic Drive; do
+            remover "product/app/$a"
+          done
+          remover "mi_ext/product/priv-app/Messages_arm64_xhdpi"
+
+      - name: Juntar system, system_ext e product
+        run: |
+          S=tree/system
+          for p in product system_ext; do
+            sudo rm -rf "$S/system/$p"
+            sudo mkdir -p "$S/system/$p"
+            sudo cp -a "tree/$p/." "$S/system/$p/"
+            sudo rm -rf "tree/$p"
+          done
+          for p in product system_ext; do
+            if [ -d "$S/$p" ] && [ ! -L "$S/$p" ]; then
+              sudo rmdir "$S/$p" 2>/dev/null || true
+            fi
+            [ -e "$S/$p" ] || sudo ln -s "/system/$p" "$S/$p"
+          done
+          sudo du -sm tree/*
+          df -h /
+
+      - name: Gerar as imagens EROFS com contextos SELinux
+        run: |
+          mkdir -p novo
+          M=tree/system/system
+          : > fc.txt
+          sudo cat "$M/etc/selinux/plat_file_contexts" >> fc.txt
+          if sudo test -f "$M/system_ext/etc/selinux/system_ext_file_contexts"; then
+            sudo sed 's|^/system_ext|/system/system_ext|' "$M/system_ext/etc/selinux/system_ext_file_contexts" >> fc.txt
+          fi
+          if sudo test -f "$M/product/etc/selinux/product_file_contexts"; then
+            sudo sed 's|^/product|/system/product|' "$M/product/etc/selinux/product_file_contexts" >> fc.txt
+          fi
+          for f in $(sudo find tree/mi_ext -name '*file_contexts*' | head -3); do
+            sudo cat "$f" >> fc.txt
+          done
+          wc -l fc.txt
+          : > labels.txt
+          if sudo mkfs.erofs -zlz4hc,12 -T 1230768000 --mount-point=/ --file-contexts=fc.txt novo/system.img tree/system > mk-system.log 2>&1; then
+            echo "system: com contextos SELinux" >> labels.txt
+          else
+            echo "system: mkfs com contextos falhou, ultimas linhas:" >> labels.txt
+            tail -15 mk-system.log >> labels.txt
+            sudo mkfs.erofs -zlz4hc,12 -T 1230768000 --mount-point=/ novo/system.img tree/system
+            echo "system: gerado SEM contextos SELinux" >> labels.txt
+          fi
+          if sudo mkfs.erofs -zlz4hc,12 -T 1230768000 --mount-point=/mi_ext --file-contexts=fc.txt novo/mi_ext.img tree/mi_ext > mk-miext.log 2>&1; then
+            echo "mi_ext: com contextos SELinux" >> labels.txt
+          else
+            echo "mi_ext: mkfs com contextos falhou, ultimas linhas:" >> labels.txt
+            tail -15 mk-miext.log >> labels.txt
+            sudo mkfs.erofs -zlz4hc,12 -T 1230768000 --mount-point=/mi_ext novo/mi_ext.img tree/mi_ext
+            echo "mi_ext: gerado SEM contextos SELinux" >> labels.txt
+          fi
+          sudo truncate -s %1048576 novo/system.img
+          sudo truncate -s %1048576 novo/mi_ext.img
+          ls -l novo
+          cat labels.txt
+          sudo rm -rf tree
+          df -h /
+
+      - name: Baixar o zip do GSI e extrair boot, dtbo, vbmeta e vendor
+        run: |
+          gdown "https://drive.google.com/uc?id=$DRIVE_ID" -O work/gsi.zip
+          cd work
+          unzip -o gsi.zip images/boot.img images/vendor.img.gz images/dtbo.img images/vbmeta.img
+          rm -f gsi.zip
+          ls -l images
+
+      - name: Ajustar o boot.img
+        run: |
+          cd work
+          args=$(python3 ../tools/unpack_bootimg.py --boot_img images/boot.img --out bt --format=mkbootimg)
+          mkdir -p rd
+          gzip -dc bt/ramdisk | (cd rd && sudo cpio -idm 2>/dev/null)
+          f=rd/system/etc/fstab.qcom
+          sudo awk '$1 !~ /^#/ && $2=="/system" {$3="erofs"; $4="ro"} {print}' "$f" > fstab-boot.new
+          sudo sh -c "cat fstab-boot.new > $f"
+          (cd rd && sudo find . | sudo cpio -o -H newc -R 0:0 2>/dev/null) | gzip -9 > ramdisk.new
+          eval python3 ../tools/mkbootimg.py $args --ramdisk ramdisk.new -o boot_novo.img
+          ls -l boot_novo.img
+
+      - name: Ajustar o vendor
+        run: |
+          cd work
+          mkdir -p v mnt
+          gzip -dc images/vendor.img.gz > v/vendor.img
+          if [ "$(od -An -tx1 -N4 v/vendor.img | tr -d ' \n')" = "3aff26ed" ]; then
+            simg2img v/vendor.img v/vendor.raw
+            mv v/vendor.raw v/vendor.img
+          fi
+          sudo mount -o loop,rw v/vendor.img mnt
+          if [ "$VENDOR_SDK" != "37" ]; then
+            for p in mnt/build.prop mnt/etc/build.prop; do
+              if sudo test -f "$p"; then
+                sudo sed -E "s/^(ro\.vendor\.build\.version\.sdk)=.*/\1=$VENDOR_SDK/; s/^(ro\.vendor\.build\.version\.sdk_full)=.*/\1=$VENDOR_SDK.0/; s/^(ro\.vendor\.build\.version\.release)=.*/\1=$((VENDOR_SDK-20))/; s/^(ro\.vendor\.build\.version\.release_or_codename)=.*/\1=$((VENDOR_SDK-20))/" "$p" > prop.new
+                sudo sh -c "cat prop.new > $p"
+              fi
+            done
+          fi
+          fs=mnt/etc/fstab.qcom
+          sudo awk '$1 !~ /^#/ && $2=="/system" {$3="erofs"; $4="ro"} {print}' "$fs" > fstab-vendor.new
+          sudo sh -c "cat fstab-vendor.new > $fs"
+          echo '/dev/block/bootdevice/by-name/cust /mi_ext erofs ro,nosuid,nodev wait,nofail' | sudo tee -a "$fs" > /dev/null
+          sudo grep -E '^[^#]*[[:space:]](/system|/mi_ext)[[:space:]]' "$fs" | tr -s ' \t' ' ' > ../vendor-fstab.txt
+          sudo umount mnt
+          ls -l v/vendor.img
+
+      - name: Montar o pacote
+        run: |
+          mkdir -p pkg/images pkg/META-INF/com/google/android
+          cp work/boot_novo.img pkg/images/boot.img
+          cp work/images/dtbo.img work/images/vbmeta.img pkg/images/
+          gzip -6 -c work/v/vendor.img > pkg/images/vendor.img.gz
+          split -b 1024M -d -a 2 novo/system.img pkg/images/system.img.
+          cp novo/mi_ext.img pkg/images/mi_ext.img
+          SYSTEM_MIB=$(( $(stat -c %s novo/system.img) / 1048576 ))
+          MIEXT_MIB=$(( $(stat -c %s novo/mi_ext.img) / 1048576 ))
+          VENDOR_MIB=$(( $(stat -c %s work/v/vendor.img) / 1048576 ))
+          SYSTEM_MD5=$(md5sum novo/system.img | cut -d' ' -f1)
+          MIEXT_MD5=$(md5sum novo/mi_ext.img | cut -d' ' -f1)
+          VENDOR_MD5=$(md5sum work/v/vendor.img | cut -d' ' -f1)
+          PARTS=$(ls pkg/images | grep '^system\.img\.' | tr '\n' ' ')
+          echo "# dummy - o instalador de verdade e o update-binary" > pkg/META-INF/com/google/android/updater-script
+          cat > pkg/META-INF/com/google/android/update-binary <<'EOF'
+          #!/sbin/sh
+          # Port HyperOS 3 (base creek) para Redmi Note 8 / 8T (ginkgo / willow)
+          OUTFD="/proc/self/fd/$2"
+          ZIP="$3"
+
+          ui_print() { echo "ui_print $1" >> "$OUTFD"; echo "ui_print" >> "$OUTFD"; }
+          progress() { echo "set_progress $1" >> "$OUTFD"; }
+          abort() { ui_print " "; ui_print "!!! ERRO: $1"; ui_print "!!! Nada foi gravado."; exit 1; }
+          fail() { ui_print " "; ui_print "!!! ERRO: $1"; ui_print "!!! As particoes podem estar corrompidas. Nao reinicie; grave outra ROM."; exit 1; }
+
+          SYSTEM_MIB=@@SYSTEM_MIB@@
+          SYSTEM_MD5=@@SYSTEM_MD5@@
+          SYSTEM_PARTS="@@SYSTEM_PARTS@@"
+          MIEXT_MIB=@@MIEXT_MIB@@
+          MIEXT_MD5=@@MIEXT_MD5@@
+          VENDOR_MIB=@@VENDOR_MIB@@
+          VENDOR_MD5=@@VENDOR_MD5@@
+          PART_MIB=1024
+
+          ui_print "============================================="
+          ui_print "  HyperOS 3 (Android 16) - base creek"
+          ui_print "  para Redmi Note 8 / 8T (ginkgo / willow)"
+          ui_print "============================================="
+
+          DEV=""
+          for p in ro.boot.hwname ro.product.device ro.build.product ro.product.vendor.device; do
+            v="$(getprop $p)"
+            case "$v" in ginkgo|willow) DEV="$v";; esac
+          done
+          [ -n "$DEV" ] || abort "este pacote e so para Redmi Note 8 / 8T (ginkgo/willow)"
+          ui_print "- Aparelho: $DEV"
+
+          BD=/dev/block/by-name
+          [ -e $BD/system ] || BD=/dev/block/bootdevice/by-name
+          for p in system vendor cust boot dtbo vbmeta metadata; do
+            [ -e $BD/$p ] || abort "particao $p nao encontrada"
+          done
+
+          SYS_SEC=$(blockdev --getsz $BD/system)
+          [ "$SYS_SEC" -ge $((SYSTEM_MIB*2048)) ] || abort "particao system pequena demais ($((SYS_SEC/2048)) MiB, precisa de $SYSTEM_MIB MiB)"
+          CUST_SEC=$(blockdev --getsz $BD/cust)
+          [ "$CUST_SEC" -ge $((MIEXT_MIB*2048)) ] || abort "particao cust pequena demais ($((CUST_SEC/2048)) MiB, precisa de $MIEXT_MIB MiB)"
+          VEN_SEC=$(blockdev --getsz $BD/vendor)
+          [ "$VEN_SEC" -ge $((VENDOR_MIB*2048)) ] || abort "particao vendor pequena demais ($((VEN_SEC/2048)) MiB, precisa de $VENDOR_MIB MiB)"
+          ui_print "- Particoes: system $((SYS_SEC/2048)) MiB, cust $((CUST_SEC/2048)) MiB, vendor $((VEN_SEC/2048)) MiB"
+
+          for t in unzip gunzip dd md5sum cut blockdev mke2fs; do
+            command -v $t >/dev/null 2>&1 || abort "o recovery nao tem a ferramenta $t"
+          done
+
+          verify() {
+            got=$(dd if="$1" bs=1048576 count="$2" 2>/dev/null | md5sum | cut -d' ' -f1)
+            [ "$got" = "$3" ]
+          }
+
+          umount /system_root /system /vendor /product /system_ext /odm /cust /mi_ext /metadata 2>/dev/null
+          progress 0.02
+
+          ui_print "- Gravando system (alguns minutos)..."
+          i=0
+          for part in $SYSTEM_PARTS; do
+            unzip -p "$ZIP" "images/$part" | dd of="$BD/system" bs=1048576 seek=$((i*PART_MIB)) 2>/dev/null || fail "falha ao gravar $part"
+            i=$((i+1))
+          done
+          progress 0.6
+          ui_print "- Verificando system..."
+          verify "$BD/system" "$SYSTEM_MIB" "$SYSTEM_MD5" || fail "checksum do system nao confere"
+          progress 0.7
+
+          ui_print "- Gravando mi_ext na particao cust..."
+          unzip -p "$ZIP" images/mi_ext.img | dd of="$BD/cust" bs=1048576 2>/dev/null || fail "falha ao gravar mi_ext"
+          verify "$BD/cust" "$MIEXT_MIB" "$MIEXT_MD5" || fail "checksum do mi_ext nao confere"
+          progress 0.8
+
+          ui_print "- Gravando vendor..."
+          unzip -p "$ZIP" images/vendor.img.gz | gunzip -c | dd of="$BD/vendor" bs=1048576 2>/dev/null || fail "falha ao gravar vendor"
+          verify "$BD/vendor" "$VENDOR_MIB" "$VENDOR_MD5" || fail "checksum do vendor nao confere"
+          progress 0.92
+
+          for p in boot dtbo vbmeta; do
+            ui_print "- Gravando $p..."
+            unzip -p "$ZIP" images/$p.img | dd of="$BD/$p" bs=1048576 2>/dev/null || fail "falha ao gravar $p"
+          done
+          progress 0.96
+
+          ui_print "- Limpando metadata..."
+          umount /metadata 2>/dev/null
+          mke2fs -F -q -t ext4 -b 4096 $BD/metadata >/dev/null 2>&1 || ui_print "  (nao foi possivel limpar metadata)"
+          progress 1.0
+
+          ui_print " "
+          ui_print "============================================="
+          ui_print "  Pronto!"
+          ui_print "  OBRIGATORIO: Wipe -> Format Data (digite yes),"
+          ui_print "  depois Reboot -> System."
+          ui_print "  A primeira inicializacao pode demorar."
+          ui_print "============================================="
+          exit 0
+          EOF
+          sed -i \
+            -e "s|@@SYSTEM_MIB@@|$SYSTEM_MIB|" \
+            -e "s|@@SYSTEM_MD5@@|$SYSTEM_MD5|" \
+            -e "s|@@SYSTEM_PARTS@@|$PARTS|" \
+            -e "s|@@MIEXT_MIB@@|$MIEXT_MIB|" \
+            -e "s|@@MIEXT_MD5@@|$MIEXT_MD5|" \
+            -e "s|@@VENDOR_MIB@@|$VENDOR_MIB|" \
+            -e "s|@@VENDOR_MD5@@|$VENDOR_MD5|" \
+            pkg/META-INF/com/google/android/update-binary
+          chmod 755 pkg/META-INF/com/google/android/update-binary
+          sh -n pkg/META-INF/com/google/android/update-binary
+          grep -n '^SYSTEM_\|^MIEXT_\|^VENDOR_' pkg/META-INF/com/google/android/update-binary > instalador-vars.txt
+          cat instalador-vars.txt
+          du -sh pkg
+          ls -l pkg/images
+
+      - name: Relatorio
+        run: |
+          {
+            echo "## Pacote do port"
+            echo ""
+            echo "| Imagem | Tamanho (MiB) |"
+            echo "|---|---|"
+            echo "| system (system + system_ext + product) | $(( $(stat -c %s novo/system.img) / 1048576 )) |"
+            echo "| mi_ext (vai para a cust) | $(( $(stat -c %s novo/mi_ext.img) / 1048576 )) |"
+            echo "| vendor | $(( $(stat -c %s work/v/vendor.img) / 1048576 )) |"
+            echo "| boot | $(( $(stat -c %s pkg/images/boot.img) / 1048576 )) |"
+            echo ""
+            echo "Pasta do pacote: $(du -sh pkg | cut -f1)"
+            echo ""
+            echo "### Contextos SELinux"
+            echo '```'
+            cat labels.txt
+            echo '```'
+            echo ""
+            echo "### Apps removidos"
+            echo '```'
+            cat removidos.txt
+            echo '```'
+            echo ""
+            echo "### fstab do vendor (linhas alteradas)"
+            echo '```'
+            cat vendor-fstab.txt
+            echo '```'
+            echo ""
+            echo "### Variaveis do instalador"
+            echo '```'
+            cat instalador-vars.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publicar o pacote
+        uses: actions/upload-artifact@v4
+        with:
+          name: ginkgo-port-pacote
+          path: pkg/
+          compression-level: 0
+          retention-days: 3
