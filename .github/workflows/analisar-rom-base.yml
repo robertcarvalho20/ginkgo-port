@@ -34,6 +34,13 @@ jobs:
             --max-tries=10 --retry-wait=5 \
             --summary-interval=60 --console-log-level=warn \
             -d work -o rom.zip "$ROM_URL"
+          ls -lh work/rom.zip
+          size=$(stat -c %s work/rom.zip)
+          if [ "$size" -lt 1000000000 ]; then
+            echo "ERRO: o arquivo baixado tem so $size bytes, nao e a ROM. Inicio do conteudo:"
+            head -c 600 work/rom.zip
+            exit 1
+          fi
 
       - name: Extrair o payload e as imagens
         run: |
@@ -85,7 +92,7 @@ jobs:
             find tree -name '*.apk' \
               | grep -iE 'framework-res|framework-ext-res|/Settings/|MiuiSystemUI|contact|dialer|mms|recorder|incall' \
               | sort | while read -r apk; do
-                loc=$(aapt dump badging "$apk" 2>/dev/null | grep -m1 '^locales:')
+                loc=$(aapt dump badging "$apk" 2>/dev/null | grep -m1 '^locales:' || true)
                 if [ -z "$loc" ]; then r="sem info"
                 elif echo "$loc" | grep -qE "pt[-_]?r?BR"; then r="pt-BR: SIM"
                 else r="pt-BR: NAO"; fi
