@@ -1,0 +1,151 @@
+name: Preparar boot e vendor (teste)
+
+on:
+  workflow_dispatch:
+    inputs:
+      drive_id:
+        description: "ID do arquivo no Google Drive"
+        required: true
+        default: "1zETh1vs-MbizeUNVwYNW3IJKLjW6jWhb"
+        type: string
+      vendor_sdk:
+        description: "SDK que o vendor deve declarar (36 = Android 16)"
+        required: true
+        default: "36"
+        type: string
+
+jobs:
+  preparar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      DRIVE_ID: ${{ inputs.drive_id }}
+      VENDOR_SDK: ${{ inputs.vendor_sdk }}
+    steps:
+      - name: Instalar ferramentas
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq unzip file lz4 cpio binutils python3-pip git e2fsprogs android-sdk-libsparse-utils
+          pip install --break-system-packages gdown
+          git clone --depth 1 https://android.googlesource.com/platform/system/tools/mkbootimg tools
+
+      - name: Baixar o zip e extrair as imagens
+        run: |
+          mkdir -p work
+          gdown "https://drive.google.com/uc?id=$DRIVE_ID" -O work/gsi.zip
+          cd work
+          unzip -o gsi.zip images/boot.img images/vendor.img.gz images/dtbo.img images/vbmeta.img
+          rm -f gsi.zip
+          ls -l images
+
+      - name: Ajustar o boot.img
+        run: |
+          cd work
+          args=$(python3 ../tools/unpack_bootimg.py --boot_img images/boot.img --out bt --format=mkbootimg)
+          echo "$args" > ../boot-args.txt
+          mkdir -p rd
+          gzip -dc bt/ramdisk | (cd rd && sudo cpio -idm 2>/dev/null)
+          f=rd/system/etc/fstab.qcom
+          sudo cp -p "$f" ../fstab-boot-antes.txt
+          sudo awk '$1 !~ /^#/ && $2=="/system" {$3="erofs"; $4="ro"} {print}' "$f" | sudo tee "$f.new" > /dev/null
+          sudo chmod --reference=../fstab-boot-antes.txt "$f.new"
+          sudo mv "$f.new" "$f"
+          {
+            echo "linhas de /system no fstab do ramdisk:"
+            echo "antes:"
+            sudo grep -E '^[^#]*[[:space:]]/system[[:space:]]' ../fstab-boot-antes.txt | tr -s ' \t' ' '
+            echo "depois:"
+            sudo grep -E '^[^#]*[[:space:]]/system[[:space:]]' "$f" | tr -s ' \t' ' '
+          } > ../boot-resultado.txt
+          (cd rd && sudo find . | sudo cpio -o -H newc -R 0:0 2>/dev/null) | gzip -9 > ramdisk.new
+          eval python3 ../tools/mkbootimg.py $args --ramdisk ramdisk.new -o boot_novo.img
+          ls -l boot_novo.img
+          python3 ../tools/unpack_bootimg.py --boot_img boot_novo.img --out bt2 > ../boot-verifica.txt
+          {
+            echo ""
+            echo "boot_novo.img: $(stat -c %s boot_novo.img) bytes (original: $(stat -c %s images/boot.img))"
+            echo ""
+            echo "cmdline completa:"
+            grep -o "\-\-cmdline.*" ../boot-args.txt | fold -w 100
+          } >> ../boot-resultado.txt
+          cat ../boot-resultado.txt
+
+      - name: Checar EROFS no kernel
+        run: |
+          cd work
+          gzip -dc bt/kernel > kernel.raw 2>/dev/null || cp bt/kernel kernel.raw
+          n=$(strings -n 6 kernel.raw | grep -ci 'erofs' || true)
+          {
+            echo "ocorrencias de erofs no kernel: $n"
+            strings -n 6 kernel.raw | grep -i 'erofs' | head -8 || true
+          } > ../kernel-erofs.txt
+          cat ../kernel-erofs.txt
+
+      - name: Ajustar o vendor
+        run: |
+          cd work
+          mkdir -p v mnt
+          gzip -dc images/vendor.img.gz > v/vendor.img
+          if [ "$(od -An -tx1 -N4 v/vendor.img | tr -d ' \n')" = "3aff26ed" ]; then
+            simg2img v/vendor.img v/vendor.raw
+            mv v/vendor.raw v/vendor.img
+          fi
+          RW=1
+          if ! sudo mount -o loop,rw v/vendor.img mnt; then
+            RW=0
+            sudo mount -o loop,ro v/vendor.img mnt
+          fi
+          {
+            echo "montagem de escrita: $RW (1 = ok, 0 = so leitura)"
+            echo ""
+            echo "props antes:"
+            sudo grep -hE 'ro.vendor.build.version.(sdk|sdk_full|release|release_or_codename)=' mnt/build.prop mnt/etc/build.prop 2>/dev/null | sort -u || true
+          } > ../vendor-resultado.txt
+          if [ "$RW" = "1" ]; then
+            sdk="$VENDOR_SDK"
+            rel="$VENDOR_SDK"
+            for p in mnt/build.prop mnt/etc/build.prop; do
+              if sudo test -f "$p"; then
+                sudo sed -i -E "s/^(ro\.vendor\.build\.version\.sdk)=.*/\1=$sdk/; s/^(ro\.vendor\.build\.version\.sdk_full)=.*/\1=$sdk.0/; s/^(ro\.vendor\.build\.version\.release)=.*/\1=$((sdk-20))/; s/^(ro\.vendor\.build\.version\.release_or_codename)=.*/\1=$((sdk-20))/" "$p"
+              fi
+            done
+            fs=mnt/etc/fstab.qcom
+            sudo awk '$1 !~ /^#/ && $2=="/system" {$3="erofs"; $4="ro"} {print}' "$fs" | sudo tee "$fs.new" > /dev/null
+            sudo chmod --reference="$fs" "$fs.new"
+            sudo mv "$fs.new" "$fs"
+            echo '/dev/block/bootdevice/by-name/cust /mi_ext erofs ro,nosuid,nodev wait,nofail' | sudo tee -a "$fs" > /dev/null
+          fi
+          {
+            echo ""
+            echo "props depois:"
+            sudo grep -hE 'ro.vendor.build.version.(sdk|sdk_full|release|release_or_codename)=' mnt/build.prop mnt/etc/build.prop 2>/dev/null | sort -u || true
+            echo ""
+            echo "fstab.qcom do vendor (linhas de /system e /mi_ext):"
+            sudo grep -E '^[^#]*[[:space:]](/system|/mi_ext)[[:space:]]' mnt/etc/fstab.qcom | tr -s ' \t' ' ' || true
+            echo ""
+            echo "sepolicy do vendor:"
+            sudo ls mnt/etc/selinux | head -30 || true
+            echo "plat_sepolicy_vers.txt:"
+            sudo cat mnt/etc/selinux/plat_sepolicy_vers.txt 2>/dev/null || echo "nao existe"
+          } >> ../vendor-resultado.txt
+          sudo umount mnt
+          cat ../vendor-resultado.txt
+
+      - name: Relatorio
+        run: |
+          {
+            echo "## Boot (ramdisk)"
+            echo '```'
+            cat boot-resultado.txt
+            echo '```'
+            echo ""
+            echo "## Kernel e EROFS"
+            echo '```'
+            cat kernel-erofs.txt
+            echo '```'
+            echo ""
+            echo "## Vendor"
+            echo '```'
+            cat vendor-resultado.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
