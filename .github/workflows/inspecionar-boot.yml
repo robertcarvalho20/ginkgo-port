@@ -1,0 +1,113 @@
+name: Inspecionar o boot.img do GSI
+
+on:
+  workflow_dispatch:
+    inputs:
+      drive_id:
+        description: "ID do arquivo no Google Drive"
+        required: true
+        default: "1zETh1vs-MbizeUNVwYNW3IJKLjW6jWhb"
+        type: string
+
+jobs:
+  inspecionar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      DRIVE_ID: ${{ inputs.drive_id }}
+    steps:
+      - name: Instalar ferramentas
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq unzip file lz4 cpio device-tree-compiler binutils python3-pip
+          pip install --break-system-packages gdown
+
+      - name: Baixar o zip e extrair boot e dtbo
+        run: |
+          mkdir -p work
+          gdown "https://drive.google.com/uc?id=$DRIVE_ID" -O work/gsi.zip
+          ls -lh work/gsi.zip
+          cd work
+          unzip -o gsi.zip images/boot.img images/dtbo.img
+          rm -f gsi.zip
+          ls -l images
+
+      - name: Desmontar o boot.img
+        run: |
+          cd work
+          curl -sL 'https://android.googlesource.com/platform/system/tools/mkbootimg/+/refs/heads/main/unpack_bootimg.py?format=TEXT' | base64 -d > unpack_bootimg.py
+          python3 unpack_bootimg.py --boot_img images/boot.img --out bt | tee ../cabecalho.txt
+          ls -l bt | tee ../bt-lista.txt
+
+      - name: Abrir o ramdisk e procurar o fstab
+        run: |
+          cd work
+          mkdir -p rd
+          tipo=$(file -b bt/ramdisk || true)
+          echo "ramdisk: $tipo" > ../ramdisk.txt
+          case "$tipo" in
+            *gzip*) gzip -dc bt/ramdisk | (cd rd && sudo cpio -idm 2>/dev/null) ;;
+            *LZ4*|*lz4*) lz4 -dc bt/ramdisk | (cd rd && sudo cpio -idm 2>/dev/null) ;;
+            *cpio*) (cd rd && sudo cpio -idm 2>/dev/null) < bt/ramdisk ;;
+            *) echo "formato do ramdisk desconhecido" >> ../ramdisk.txt ;;
+          esac || true
+          {
+            echo ""
+            echo "arquivos na raiz do ramdisk:"
+            sudo ls rd | head -60
+            echo ""
+            echo "fstab encontrados:"
+            sudo find rd -iname '*fstab*' | head -20
+          } >> ../ramdisk.txt
+          for f in $(sudo find rd -iname 'fstab*' -type f | head -3); do
+            echo "" >> ../ramdisk.txt
+            echo "=== $f (sem comentarios)" >> ../ramdisk.txt
+            sudo grep -vE '^\s*(#|$)' "$f" | tr -s ' \t' ' ' | head -40 >> ../ramdisk.txt || true
+          done
+          cat ../ramdisk.txt
+
+      - name: Ler a arvore de dispositivos e o kernel
+        run: |
+          cd work
+          : > ../dt.txt
+          if [ -s bt/dtb ]; then
+            dtc -I dtb -O dts bt/dtb > dtb.dts 2>/dev/null || true
+            {
+              echo "nos fstab no dtb:"
+              grep -n -B2 -A30 'fstab {' dtb.dts | head -120 || true
+            } >> ../dt.txt
+          else
+            echo "boot.img sem dtb separado" >> ../dt.txt
+          fi
+          {
+            echo ""
+            echo "versao do kernel:"
+            tipo=$(file -b bt/kernel || true)
+            echo "$tipo"
+            if echo "$tipo" | grep -qi gzip; then
+              gzip -dc bt/kernel > kernel.raw 2>/dev/null || true
+            else
+              cp bt/kernel kernel.raw
+            fi
+            strings -n 12 kernel.raw | grep -m2 'Linux version' || echo "nao achei a string de versao"
+          } >> ../dt.txt
+          cat ../dt.txt
+
+      - name: Relatorio
+        run: |
+          {
+            echo "## Cabecalho do boot.img"
+            echo '```'
+            cat cabecalho.txt
+            echo '```'
+            echo ""
+            echo "## Ramdisk e fstab"
+            echo '```'
+            cat ramdisk.txt
+            echo '```'
+            echo ""
+            echo "## DTB e kernel"
+            echo '```'
+            cat dt.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
