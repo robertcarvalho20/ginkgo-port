@@ -1,0 +1,114 @@
+name: Inspecionar o vendor do zip do GSI
+
+on:
+  workflow_dispatch:
+    inputs:
+      drive_id:
+        description: "ID do arquivo no Google Drive"
+        required: true
+        default: "1zETh1vs-MbizeUNVwYNW3IJKLjW6jWhb"
+        type: string
+
+jobs:
+  inspecionar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      DRIVE_ID: ${{ inputs.drive_id }}
+    steps:
+      - name: Instalar ferramentas
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq erofs-utils android-sdk-libsparse-utils unzip file python3-pip
+          pip install --break-system-packages gdown
+
+      - name: Baixar o zip do Drive
+        run: |
+          mkdir -p work
+          gdown "https://drive.google.com/uc?id=$DRIVE_ID" -O work/gsi.zip
+          ls -lh work/gsi.zip
+          size=$(stat -c %s work/gsi.zip)
+          if [ "$size" -lt 50000000 ]; then
+            echo "ERRO: o arquivo baixado tem so $size bytes. Inicio do conteudo:"
+            head -c 600 work/gsi.zip
+            exit 1
+          fi
+          file work/gsi.zip
+
+      - name: Listar o conteudo do zip
+        run: |
+          cd work
+          unzip -l gsi.zip | head -150 > ../lista.txt
+          cat ../lista.txt
+          mkdir -p z
+          unzip -o gsi.zip 'META-INF/*' -d z || true
+          : > ../script.txt
+          for f in $(find z -type f \( -name 'updater-script' -o -name '*.sh' \) | head -5); do
+            echo "=== $f" >> ../script.txt
+            head -c 4000 "$f" >> ../script.txt
+            echo "" >> ../script.txt
+          done
+          cat ../script.txt
+
+      - name: Extrair e analisar o vendor
+        run: |
+          cd work
+          img=$(unzip -Z1 gsi.zip | grep -iE '(^|/)vendor\.img$' | head -1 || true)
+          if [ -z "$img" ]; then
+            echo "vendor.img nao encontrado como arquivo simples no zip" > ../vendor.txt
+            exit 0
+          fi
+          mkdir -p v
+          unzip -o gsi.zip "$img" -d v
+          f="v/$img"
+          if [ "$(od -An -tx1 -N4 "$f" | tr -d ' \n')" = "3aff26ed" ]; then
+            simg2img "$f" v/vendor.raw
+            f=v/vendor.raw
+          fi
+          mkdir -p mnt vtree
+          e=$(od -An -tx1 -j1024 -N4 "$f" | tr -d ' \n')
+          if [ "$e" = "e2e1f5e0" ]; then
+            fs=EROFS
+            sudo fsck.erofs --extract=vtree "$f" || true
+            root=vtree
+          else
+            fs=ext4
+            sudo mount -o ro,loop "$f" mnt
+            root=mnt
+          fi
+          {
+            echo "sistema de arquivos: $fs"
+            echo "tamanho da imagem: $(( $(stat -c %s "$f") / 1048576 )) MiB"
+            echo ""
+            echo "propriedades do vendor:"
+            sudo grep -hE 'ro.vendor.build.(fingerprint|version.release|version.sdk)|ro.product.vendor.(device|name|model)' \
+              "$root/build.prop" "$root/etc/build.prop" 2>/dev/null | sort -u || true
+            echo ""
+            echo "arquivos fstab:"
+            sudo ls "$root/etc" | grep -i fstab || true
+            echo ""
+            if sudo test -f "$root/etc/fstab.qcom"; then
+              echo "fstab.qcom (60 primeiras linhas):"
+              sudo head -60 "$root/etc/fstab.qcom"
+            fi
+          } > ../vendor.txt
+          cat ../vendor.txt
+
+      - name: Relatorio
+        run: |
+          {
+            echo "## Conteudo do zip"
+            echo '```'
+            cat lista.txt
+            echo '```'
+            echo ""
+            echo "## Script de instalacao"
+            echo '```'
+            cat script.txt
+            echo '```'
+            echo ""
+            echo "## Vendor"
+            echo '```'
+            cat vendor.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
