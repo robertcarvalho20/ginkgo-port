@@ -1,0 +1,138 @@
+name: Montar imagens do port
+
+on:
+  workflow_dispatch:
+    inputs:
+      rom_url:
+        description: "Link direto do zip da ROM da Indonesia (com payload.bin)"
+        required: true
+        type: string
+
+jobs:
+  montar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      ROM_URL: ${{ inputs.rom_url }}
+    steps:
+      - name: Liberar espaco no runner
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Instalar ferramentas
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aria2 erofs-utils
+          go install github.com/ssut/payload-dumper-go@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Baixar a ROM
+        run: |
+          mkdir -p work out
+          aria2c -x 16 -s 16 -k 8M --file-allocation=none \
+            --max-tries=10 --retry-wait=5 \
+            --summary-interval=60 --console-log-level=warn \
+            -d work -o rom.zip "$ROM_URL"
+          ls -lh work/rom.zip
+          size=$(stat -c %s work/rom.zip)
+          if [ "$size" -lt 1000000000 ]; then
+            echo "ERRO: o arquivo baixado tem so $size bytes, nao e a ROM. Inicio do conteudo:"
+            head -c 600 work/rom.zip
+            exit 1
+          fi
+
+      - name: Extrair o payload e as imagens
+        run: |
+          unzip -o work/rom.zip payload.bin -d work
+          rm -f work/rom.zip
+          payload-dumper-go -p system,system_ext,product,mi_ext -o out work/payload.bin
+          find out -name '*.img' -exec mv {} out/ \; 2>/dev/null || true
+          rm -f work/payload.bin
+          ls -lh out
+
+      - name: Extrair o conteudo das imagens
+        run: |
+          mkdir -p tree
+          for n in system system_ext product mi_ext; do
+            mkdir -p "tree/$n"
+            sudo fsck.erofs --extract="tree/$n" --preserve "out/$n.img" \
+              || sudo fsck.erofs --extract="tree/$n" "out/$n.img"
+          done
+          rm -f out/*.img
+          sudo du -sm tree/*
+          df -h /
+
+      - name: Remover os apps escolhidos
+        run: |
+          : > removidos.txt
+          remover() {
+            if [ -e "tree/$1" ]; then
+              sz=$(sudo du -sm "tree/$1" | cut -f1)
+              sudo rm -rf "tree/$1"
+              echo "removido: $1 (${sz} MiB)" | tee -a removidos.txt
+            else
+              echo "NAO ENCONTRADO: $1" | tee -a removidos.txt
+            fi
+          }
+          for a in Photos Gmail2 YouTube Maps Meet YTMusic Drive; do
+            remover "product/app/$a"
+          done
+          remover "mi_ext/product/priv-app/Messages_arm64_xhdpi"
+
+      - name: Juntar system, system_ext e product
+        run: |
+          S=tree/system
+          {
+            echo "raiz do system:"
+            sudo ls -la "$S"
+            echo ""
+            echo "links em ate 3 niveis (antes de juntar):"
+            sudo find "$S" -maxdepth 3 -type l -printf '%P -> %l\n' | sort | head -60
+          } > estrutura.txt
+          for p in product system_ext; do
+            sudo rm -rf "$S/system/$p"
+            sudo mkdir -p "$S/system/$p"
+            sudo cp -a "tree/$p/." "$S/system/$p/"
+            sudo rm -rf "tree/$p"
+          done
+          for p in product system_ext; do
+            if [ -d "$S/$p" ] && [ ! -L "$S/$p" ]; then
+              sudo rmdir "$S/$p" 2>/dev/null || true
+            fi
+            [ -e "$S/$p" ] || sudo ln -s "/system/$p" "$S/$p"
+          done
+          sudo du -sm tree/*
+          df -h /
+
+      - name: Gerar as imagens EROFS
+        run: |
+          mkdir -p novo
+          sudo mkfs.erofs -zlz4hc,12 -T 1230768000 --mount-point=/ novo/system.img tree/system
+          sudo mkfs.erofs -zlz4hc,12 -T 1230768000 --mount-point=/mi_ext novo/mi_ext.img tree/mi_ext
+          ls -l novo
+
+      - name: Relatorio
+        run: |
+          s=$(( $(stat -c %s novo/system.img) / 1048576 ))
+          m=$(( $(stat -c %s novo/mi_ext.img) / 1048576 ))
+          cap_s=4464
+          cap_c=1008
+          {
+            echo "## Imagens do port (EROFS, MiB)"
+            echo ""
+            echo "| Imagem | Tamanho | Espaco disponivel | Folga |"
+            echo "|---|---|---|---|"
+            echo "| system (system + system_ext + product) | $s | $cap_s | $((cap_s - s)) |"
+            echo "| mi_ext | $m | $cap_c | $((cap_c - m)) |"
+            echo ""
+            echo "### Apps removidos"
+            echo '```'
+            cat removidos.txt
+            echo '```'
+            echo ""
+            echo "### Estrutura da raiz do system (antes de juntar)"
+            echo '```'
+            cat estrutura.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
