@@ -41,11 +41,11 @@ jobs:
           unzip -l gsi.zip | head -150 > ../lista.txt
           cat ../lista.txt
           mkdir -p z
-          unzip -o gsi.zip 'META-INF/*' -d z || true
+          unzip -o gsi.zip 'META-INF/*' README.txt -d z || true
           : > ../script.txt
-          for f in $(find z -type f \( -name 'updater-script' -o -name '*.sh' \) | head -5); do
+          for f in $(find z -type f | sort); do
             echo "=== $f" >> ../script.txt
-            head -c 4000 "$f" >> ../script.txt
+            head -c 9000 "$f" >> ../script.txt
             echo "" >> ../script.txt
           done
           cat ../script.txt
@@ -53,7 +53,7 @@ jobs:
       - name: Extrair e analisar o vendor
         run: |
           cd work
-          img=$(unzip -Z1 gsi.zip | grep -iE '(^|/)vendor\.img$' | head -1 || true)
+          img=$(unzip -Z1 gsi.zip | grep -iE '(^|/)vendor\.img(\.gz)?$' | head -1 || true)
           if [ -z "$img" ]; then
             echo "vendor.img nao encontrado como arquivo simples no zip" > ../vendor.txt
             exit 0
@@ -61,6 +61,12 @@ jobs:
           mkdir -p v
           unzip -o gsi.zip "$img" -d v
           f="v/$img"
+          case "$f" in
+            *.gz)
+              gzip -dc "$f" > v/vendor.raw.img
+              f=v/vendor.raw.img
+              ;;
+          esac
           if [ "$(od -An -tx1 -N4 "$f" | tr -d ' \n')" = "3aff26ed" ]; then
             simg2img "$f" v/vendor.raw
             f=v/vendor.raw
