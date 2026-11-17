@@ -1,0 +1,165 @@
+name: Diagnosticar a politica SELinux
+
+on:
+  workflow_dispatch:
+    inputs:
+      rom_url:
+        description: "Link direto do zip da ROM base (creek, Indonesia, com payload.bin)"
+        required: true
+        type: string
+      drive_id:
+        description: "ID do zip do GSI no Google Drive"
+        required: true
+        default: "1zETh1vs-MbizeUNVwYNW3IJKLjW6jWhb"
+        type: string
+
+jobs:
+  diagnosticar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      ROM_URL: ${{ inputs.rom_url }}
+      DRIVE_ID: ${{ inputs.drive_id }}
+    steps:
+      - name: Liberar espaco no runner
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Instalar ferramentas
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aria2 erofs-utils unzip e2fsprogs secilc python3-pip
+          pip install --break-system-packages gdown
+          go install github.com/ssut/payload-dumper-go@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          secilc --version || true
+
+      - name: Baixar a ROM base e extrair as imagens
+        run: |
+          mkdir -p work out
+          aria2c -x 16 -s 16 -k 8M --file-allocation=none \
+            --max-tries=10 --retry-wait=5 \
+            --summary-interval=60 --console-log-level=warn \
+            -d work -o rom.zip "$ROM_URL"
+          size=$(stat -c %s work/rom.zip)
+          if [ "$size" -lt 1000000000 ]; then
+            echo "ERRO: o arquivo baixado tem so $size bytes, nao e a ROM."
+            exit 1
+          fi
+          unzip -o work/rom.zip payload.bin -d work
+          rm -f work/rom.zip
+          payload-dumper-go -p system,system_ext,product -o out work/payload.bin
+          find out -name '*.img' -exec mv {} out/ \; 2>/dev/null || true
+          rm -f work/payload.bin
+          ls -lh out
+
+      - name: Extrair o conteudo das imagens
+        run: |
+          mkdir -p tree
+          for n in system system_ext product; do
+            mkdir -p "tree/$n"
+            sudo fsck.erofs --extract="tree/$n" --preserve "out/$n.img" \
+              || sudo fsck.erofs --extract="tree/$n" "out/$n.img"
+          done
+          rm -f out/*.img
+          df -h /
+
+      - name: Baixar o GSI e extrair a politica do vendor e do GSI
+        run: |
+          gdown "https://drive.google.com/uc?id=$DRIVE_ID" -O work/gsi.zip
+          cd work
+          unzip -o gsi.zip 'images/vendor.img.gz' 'images/system.img.*.gz'
+          rm -f gsi.zip
+          mkdir -p ../vsel ../gsel vmnt gmnt
+          gzip -dc images/vendor.img.gz > vendor.img
+          sudo mount -o loop,ro vendor.img vmnt
+          sudo cp -r vmnt/etc/selinux/. ../vsel/
+          sudo umount vmnt
+          rm -f vendor.img
+          : > gsi_system.img
+          for p in 00 01 02 03 04 05; do
+            gzip -dc "images/system.img.$p.gz" >> gsi_system.img
+            rm -f "images/system.img.$p.gz"
+          done
+          sudo mount -o loop,ro gsi_system.img gmnt
+          g=$(sudo find gmnt -maxdepth 4 -name plat_sepolicy.cil | head -1)
+          echo "politica do GSI em: $g"
+          sudo cp -r "$(dirname "$g")/." ../gsel/
+          sudo umount gmnt
+          rm -f gsi_system.img
+          cd ..
+          sudo chown -R "$(id -u):$(id -g)" vsel gsel
+          ls vsel | head -40
+          ls gsel/mapping | head -60
+
+      - name: Compilar as variantes
+        run: |
+          VER=$(cat vsel/plat_sepolicy_vers.txt | tr -d '\n ')
+          SYS=tree/system/system/etc/selinux
+          SE=tree/system_ext/etc/selinux
+          PR=tree/product/etc/selinux
+          V=vsel
+          : > resultado-compilacao.txt
+
+          compilar() {
+            nome="$1"
+            plat="$2"
+            map="$3"
+            args=(-m -M true -G -N -c 30 "$plat")
+            if sudo test -f "$map"; then
+              args+=("$map")
+            else
+              echo "$nome: mapping ausente ($map)" >> resultado-compilacao.txt
+            fi
+            for f in "$SE/system_ext_sepolicy.cil" "$SE/mapping/$VER.cil" "$PR/product_sepolicy.cil" "$PR/mapping/$VER.cil" "$V/plat_pub_versioned.cil" "$V/vendor_sepolicy.cil" "$V/odm_sepolicy.cil"; do
+              if sudo test -f "$f"; then args+=("$f"); fi
+            done
+            if sudo secilc "${args[@]}" -o "politica-$nome.bin" -f /dev/null > "log-$nome.txt" 2>&1; then
+              echo "$nome: COMPILOU" >> resultado-compilacao.txt
+            else
+              echo "$nome: FALHOU" >> resultado-compilacao.txt
+              head -20 "log-$nome.txt" >> resultado-compilacao.txt
+            fi
+            echo "" >> resultado-compilacao.txt
+          }
+
+          compilar V1-creek-puro "$SYS/plat_sepolicy.cil" "$SYS/mapping/$VER.cil"
+          compilar V2-creek-com-mapping-do-gsi "$SYS/plat_sepolicy.cil" "gsel/mapping/$VER.cil"
+          compilar V3-plataforma-do-gsi "gsel/plat_sepolicy.cil" "gsel/mapping/$VER.cil"
+          cat resultado-compilacao.txt
+
+      - name: Relatorio
+        run: |
+          VER=$(cat vsel/plat_sepolicy_vers.txt | tr -d '\n ')
+          SYS=tree/system/system/etc/selinux
+          {
+            echo "## Versao da politica do vendor: $VER"
+            echo ""
+            echo "### Mappings que o system do creek tem"
+            echo '```'
+            sudo ls "$SYS/mapping" | tr '\n' ' ' | fold -w 90
+            echo ""
+            echo '```'
+            echo ""
+            echo "### Mappings do GSI (Android 17)"
+            echo '```'
+            ls gsel/mapping | tr '\n' ' ' | fold -w 90
+            echo ""
+            echo '```'
+            echo ""
+            echo "### Hashes (system do creek x precompilada do vendor)"
+            echo '```'
+            echo "plat system : $(sudo cat "$SYS/plat_sepolicy_and_mapping.sha256" 2>/dev/null | cut -c1-20)"
+            echo "plat vendor : $(cut -c1-20 vsel/precompiled_sepolicy.plat_sepolicy_and_mapping.sha256 2>/dev/null)"
+            echo "sys_ext sys : $(sudo cat tree/system_ext/etc/selinux/system_ext_sepolicy_and_mapping.sha256 2>/dev/null | cut -c1-20)"
+            echo "sys_ext ven : $(cut -c1-20 vsel/precompiled_sepolicy.system_ext_sepolicy_and_mapping.sha256 2>/dev/null)"
+            echo "product sys : $(sudo cat tree/product/etc/selinux/product_sepolicy_and_mapping.sha256 2>/dev/null | cut -c1-20)"
+            echo "product ven : $(cut -c1-20 vsel/precompiled_sepolicy.product_sepolicy_and_mapping.sha256 2>/dev/null)"
+            echo '```'
+            echo ""
+            echo "### Resultado das compilacoes (secilc)"
+            echo '```'
+            cat resultado-compilacao.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
