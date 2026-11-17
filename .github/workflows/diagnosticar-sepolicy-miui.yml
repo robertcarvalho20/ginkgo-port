@@ -1,0 +1,168 @@
+name: Diagnosticar SELinux com o vendor original MIUI 12.5
+
+on:
+  workflow_dispatch:
+    inputs:
+      rom_url:
+        description: "Link direto do zip da ROM base (creek, Indonesia, com payload.bin)"
+        required: true
+        type: string
+      miui_url:
+        description: "Link direto do zip recovery da MIUI 12.5 EEA do ginkgo"
+        required: true
+        type: string
+      drive_id:
+        description: "ID do zip do GSI no Google Drive"
+        required: true
+        default: "1zETh1vs-MbizeUNVwYNW3IJKLjW6jWhb"
+        type: string
+
+jobs:
+  diagnosticar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      ROM_URL: ${{ inputs.rom_url }}
+      MIUI_URL: ${{ inputs.miui_url }}
+      DRIVE_ID: ${{ inputs.drive_id }}
+    steps:
+      - name: Liberar espaco no runner
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Instalar ferramentas
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aria2 erofs-utils unzip e2fsprogs secilc brotli python3-pip
+          pip install --break-system-packages gdown
+          go install github.com/ssut/payload-dumper-go@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Baixar a ROM base e extrair as imagens
+        run: |
+          mkdir -p work out
+          aria2c -x 16 -s 16 -k 8M --file-allocation=none \
+            --max-tries=10 --retry-wait=5 \
+            --summary-interval=60 --console-log-level=warn \
+            -d work -o rom.zip "$ROM_URL"
+          size=$(stat -c %s work/rom.zip)
+          if [ "$size" -lt 1000000000 ]; then
+            echo "ERRO: o arquivo da ROM base tem so $size bytes."
+            exit 1
+          fi
+          unzip -o work/rom.zip payload.bin -d work
+          rm -f work/rom.zip
+          payload-dumper-go -p system,system_ext,product -o out work/payload.bin
+          find out -name '*.img' -exec mv {} out/ \; 2>/dev/null || true
+          rm -f work/payload.bin
+          mkdir -p tree
+          for n in system system_ext product; do
+            mkdir -p "tree/$n"
+            sudo fsck.erofs --extract="tree/$n" --preserve "out/$n.img" \
+              || sudo fsck.erofs --extract="tree/$n" "out/$n.img"
+          done
+          rm -f out/*.img
+          df -h /
+
+      - name: Pegar a politica do vendor do GSI (PixelOS)
+        run: |
+          gdown "https://drive.google.com/uc?id=$DRIVE_ID" -O work/gsi.zip
+          cd work
+          unzip -o gsi.zip 'images/vendor.img.gz'
+          rm -f gsi.zip
+          mkdir -p ../vsel vmnt
+          gzip -dc images/vendor.img.gz > vendor.img
+          sudo mount -o loop,ro vendor.img vmnt
+          sudo cp -r vmnt/etc/selinux/. ../vsel/
+          sudo grep -hE 'ro.vendor.build.fingerprint=' vmnt/build.prop vmnt/etc/build.prop 2>/dev/null | sort -u > ../fp-pixelos.txt || true
+          sudo umount vmnt
+          rm -f vendor.img
+          cd ..
+          sudo chown -R "$(id -u):$(id -g)" vsel
+
+      - name: Baixar a MIUI 12.5 e extrair a politica do vendor original
+        run: |
+          cd work
+          aria2c -x 16 -s 16 -k 8M --file-allocation=none \
+            --max-tries=10 --retry-wait=5 \
+            --summary-interval=60 --console-log-level=warn \
+            -o miui.zip "$MIUI_URL"
+          size=$(stat -c %s miui.zip)
+          if [ "$size" -lt 1000000000 ]; then
+            echo "ERRO: o arquivo da MIUI tem so $size bytes. Inicio do conteudo:"
+            head -c 600 miui.zip
+            exit 1
+          fi
+          unzip -o miui.zip vendor.new.dat.br vendor.transfer.list
+          rm -f miui.zip
+          brotli -d vendor.new.dat.br -o vendor.new.dat
+          curl -sL https://raw.githubusercontent.com/xpirt/sdat2img/master/sdat2img.py -o sdat2img.py
+          python3 sdat2img.py vendor.transfer.list vendor.new.dat vendor-orig.img
+          rm -f vendor.new.dat vendor.new.dat.br
+          mkdir -p ../osel omnt
+          sudo mount -o loop,ro vendor-orig.img omnt
+          sudo cp -r omnt/etc/selinux/. ../osel/
+          sudo grep -hE 'ro.vendor.build.fingerprint=' omnt/build.prop omnt/etc/build.prop 2>/dev/null | sort -u > ../fp-miui.txt || true
+          sudo umount omnt
+          cd ..
+          sudo chown -R "$(id -u):$(id -g)" osel
+          ls osel
+
+      - name: Compilar com a politica original do vendor
+        run: |
+          VER=$(tr -d '\n ' < osel/plat_sepolicy_vers.txt)
+          echo "$VER" > versao-original.txt
+          SYS=tree/system/system/etc/selinux
+          SE=tree/system_ext/etc/selinux
+          PR=tree/product/etc/selinux
+          : > uso-arquivos.txt
+          args=(-m -M true -G -N -c 30 "$SYS/plat_sepolicy.cil")
+          for f in "$SYS/mapping/$VER.cil" "$SYS/mapping/$VER.compat.cil" \
+                   "$SE/system_ext_sepolicy.cil" "$SE/mapping/$VER.cil" "$SE/mapping/$VER.compat.cil" \
+                   "$PR/product_sepolicy.cil" "$PR/mapping/$VER.cil" "$PR/mapping/$VER.compat.cil" \
+                   osel/plat_pub_versioned.cil osel/vendor_sepolicy.cil osel/odm_sepolicy.cil; do
+            if sudo test -f "$f"; then
+              args+=("$f")
+              echo "usando:  $f" >> uso-arquivos.txt
+            else
+              echo "ausente: $f" >> uso-arquivos.txt
+            fi
+          done
+          if sudo secilc "${args[@]}" -o politica-original.bin -f /dev/null > log-original.txt 2>&1; then
+            echo "COMPILOU" > resultado.txt
+            ls -l politica-original.bin >> resultado.txt
+          else
+            echo "FALHOU" > resultado.txt
+            head -25 log-original.txt >> resultado.txt
+          fi
+          cat uso-arquivos.txt
+          cat resultado.txt
+
+      - name: Relatorio
+        run: |
+          {
+            echo "## Politica do vendor original (MIUI 12.5): versao $(cat versao-original.txt)"
+            echo ""
+            echo "### Fingerprints do vendor"
+            echo '```'
+            echo "MIUI:     $(cat fp-miui.txt)"
+            echo "PixelOS:  $(cat fp-pixelos.txt)"
+            echo '```'
+            echo ""
+            echo "### Tamanho dos arquivos .cil do vendor (linhas)"
+            echo '```'
+            echo "vendor_sepolicy.cil     original: $(wc -l < osel/vendor_sepolicy.cil)   PixelOS: $(wc -l < vsel/vendor_sepolicy.cil)"
+            echo "plat_pub_versioned.cil  original: $(wc -l < osel/plat_pub_versioned.cil)   PixelOS: $(wc -l < vsel/plat_pub_versioned.cil)"
+            echo '```'
+            echo ""
+            echo "### Arquivos usados na compilacao"
+            echo '```'
+            cat uso-arquivos.txt
+            echo '```'
+            echo ""
+            echo "### Resultado (secilc)"
+            echo '```'
+            cat resultado.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
