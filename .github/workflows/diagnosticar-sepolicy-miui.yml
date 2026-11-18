@@ -20,7 +20,7 @@ on:
 jobs:
   diagnosticar:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 90
     env:
       ROM_URL: ${{ inputs.rom_url }}
       MIUI_URL: ${{ inputs.miui_url }}
@@ -82,20 +82,26 @@ jobs:
           sudo chown -R "$(id -u):$(id -g)" vsel
 
       - name: Baixar a MIUI 12.5 e extrair a politica do vendor original
+        timeout-minutes: 40
         run: |
           cd work
-          aria2c -x 16 -s 16 -k 8M --file-allocation=none \
-            --max-tries=10 --retry-wait=5 \
-            --summary-interval=60 --console-log-level=warn \
-            -o miui.zip "$MIUI_URL"
-          size=$(stat -c %s miui.zip)
-          if [ "$size" -lt 1000000000 ]; then
-            echo "ERRO: o arquivo da MIUI tem so $size bytes. Inicio do conteudo:"
-            head -c 600 miui.zip
-            exit 1
+          pip install --break-system-packages remotezip
+          if ! timeout 900 remotezip "$MIUI_URL" vendor.new.dat.br vendor.transfer.list; then
+            echo "remotezip falhou; baixando o zip inteiro (limite de 25 min)"
+            timeout 1500 aria2c -x 16 -s 16 -k 8M --file-allocation=none \
+              --max-tries=3 --retry-wait=5 --timeout=60 --connect-timeout=30 \
+              --summary-interval=60 --console-log-level=warn \
+              -o miui.zip "$MIUI_URL"
+            size=$(stat -c %s miui.zip)
+            if [ "$size" -lt 1000000000 ]; then
+              echo "ERRO: o arquivo da MIUI tem so $size bytes. Inicio do conteudo:"
+              head -c 600 miui.zip
+              exit 1
+            fi
+            unzip -o miui.zip vendor.new.dat.br vendor.transfer.list
+            rm -f miui.zip
           fi
-          unzip -o miui.zip vendor.new.dat.br vendor.transfer.list
-          rm -f miui.zip
+          ls -l vendor.new.dat.br vendor.transfer.list
           brotli -d vendor.new.dat.br -o vendor.new.dat
           curl -sL https://raw.githubusercontent.com/xpirt/sdat2img/master/sdat2img.py -o sdat2img.py
           python3 sdat2img.py vendor.transfer.list vendor.new.dat vendor-orig.img
