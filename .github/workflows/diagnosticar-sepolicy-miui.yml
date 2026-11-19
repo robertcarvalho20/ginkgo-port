@@ -7,9 +7,10 @@ on:
         description: "Link direto do zip da ROM base (creek, Indonesia, com payload.bin)"
         required: true
         type: string
-      miui_url:
-        description: "Link direto do zip recovery da MIUI 12.5 EEA do ginkgo"
+      miui_path:
+        description: "Caminho do zip recovery da MIUI 12.5 EEA no CDN da Xiaomi"
         required: true
+        default: "V12.5.12.0.RCOEUXM/miui_GINKGOEEAGlobal_V12.5.12.0.RCOEUXM_f9fdc6c783_11.0.zip"
         type: string
       drive_id:
         description: "ID do zip do GSI no Google Drive"
@@ -23,7 +24,7 @@ jobs:
     timeout-minutes: 90
     env:
       ROM_URL: ${{ inputs.rom_url }}
-      MIUI_URL: ${{ inputs.miui_url }}
+      MIUI_PATH: ${{ inputs.miui_path }}
       DRIVE_ID: ${{ inputs.drive_id }}
     steps:
       - name: Liberar espaco no runner
@@ -81,17 +82,37 @@ jobs:
           cd ..
           sudo chown -R "$(id -u):$(id -g)" vsel
 
+      - name: Escolher um espelho rapido da MIUI
+        timeout-minutes: 10
+        run: |
+          : > espelhos.txt
+          for host in cdnorg.d.miui.com hugeota.d.miui.com ultimateota.d.miui.com bkt-sgp-miui-ota-update-alisgp.oss-ap-southeast-1.aliyuncs.com bigota.d.miui.com; do
+            r=$(curl -s -L -r 0-4194303 -o /dev/null --max-time 25 -w '%{http_code} %{speed_download}' "https://$host/$MIUI_PATH" || true)
+            echo "$host $r" | tee -a espelhos.txt
+          done
+          host=$(awk '($2==206||$2==200) && $3>=1000000 {print $1; exit}' espelhos.txt)
+          if [ -z "$host" ]; then
+            echo "Nenhum espelho passou de 1 MB/s; usando o primeiro que respondeu."
+            host=$(awk '($2==206||$2==200) {print $1; exit}' espelhos.txt)
+          fi
+          if [ -z "$host" ]; then
+            echo "ERRO: nenhum espelho tem esse arquivo. Confira o caminho: $MIUI_PATH"
+            exit 1
+          fi
+          echo "MIUI_URL_OK=https://$host/$MIUI_PATH" >> "$GITHUB_ENV"
+          echo "escolhido: https://$host/$MIUI_PATH"
+
       - name: Baixar a MIUI 12.5 e extrair a politica do vendor original
-        timeout-minutes: 40
+        timeout-minutes: 30
         run: |
           cd work
           pip install --break-system-packages remotezip
-          if ! timeout 900 remotezip "$MIUI_URL" vendor.new.dat.br vendor.transfer.list; then
+          if ! timeout 900 remotezip "$MIUI_URL_OK" vendor.new.dat.br vendor.transfer.list; then
             echo "remotezip falhou; baixando o zip inteiro (limite de 25 min)"
             timeout 1500 aria2c -x 16 -s 16 -k 8M --file-allocation=none \
               --max-tries=3 --retry-wait=5 --timeout=60 --connect-timeout=30 \
               --summary-interval=60 --console-log-level=warn \
-              -o miui.zip "$MIUI_URL"
+              -o miui.zip "$MIUI_URL_OK"
             size=$(stat -c %s miui.zip)
             if [ "$size" -lt 1000000000 ]; then
               echo "ERRO: o arquivo da MIUI tem so $size bytes. Inicio do conteudo:"
@@ -149,6 +170,11 @@ jobs:
         run: |
           {
             echo "## Politica do vendor original (MIUI 12.5): versao $(cat versao-original.txt)"
+            echo ""
+            echo "### Espelhos testados (host, codigo, bytes/s)"
+            echo '```'
+            cat espelhos.txt
+            echo '```'
             echo ""
             echo "### Fingerprints do vendor"
             echo '```'
