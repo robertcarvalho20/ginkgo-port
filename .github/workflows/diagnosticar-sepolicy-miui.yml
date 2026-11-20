@@ -156,6 +156,7 @@ jobs:
               echo "ausente: $f" >> uso-arquivos.txt
             fi
           done
+          printf '%s\n' "${args[@]}" > args-compilacao.txt
           if sudo secilc "${args[@]}" -o politica-original.bin -f /dev/null > log-original.txt 2>&1; then
             echo "COMPILOU" > resultado.txt
             ls -l politica-original.bin >> resultado.txt
@@ -165,6 +166,40 @@ jobs:
           fi
           cat uso-arquivos.txt
           cat resultado.txt
+
+      - name: Investigar o erro de genfscon
+        run: |
+          SYS=tree/system/system/etc/selinux
+          SE=tree/system_ext/etc/selinux
+          PR=tree/product/etc/selinux
+          {
+            echo "arquivos em system/etc/selinux:"
+            sudo ls "$SYS" | tr '\n' ' ' | fold -w 90
+            echo ""
+            echo ""
+            echo "quantidade de genfscon por arquivo:"
+            for f in "$SYS/plat_sepolicy.cil" "$SE/system_ext_sepolicy.cil" "$PR/product_sepolicy.cil" osel/vendor_sepolicy.cil osel/plat_pub_versioned.cil; do
+              n=$(sudo grep -c '^(genfscon' "$f" || true)
+              echo "$n  $f"
+            done
+            echo ""
+            echo "genfscon repetidos entre arquivos (mesmo fs e caminho):"
+          } > genfs-info.txt
+          sudo awk '/^\(genfscon/ {p=$3; gsub(/"/,"",p); print FILENAME "|" $2 "|" p}' \
+            "$SYS/plat_sepolicy.cil" "$SE/system_ext_sepolicy.cil" "$PR/product_sepolicy.cil" osel/vendor_sepolicy.cil > genfscon-todos.txt || true
+          awk -F'|' '{k=$2"|"$3; c[k]++; a[k]=a[k]" "$1} END{for(k in c) if (c[k]>1) print c[k]" "k" <-"a[k]}' genfscon-todos.txt | sort -rn | head -25 | cut -c1-230 >> genfs-info.txt || true
+          echo "total de pares repetidos: $(awk -F'|' '{k=$2"|"$3; c[k]++} END{n=0; for(k in c) if (c[k]>1) n++; print n}' genfscon-todos.txt)" >> genfs-info.txt
+          args=(-m -M true -G -N -c 30 "$SYS/plat_sepolicy.cil")
+          if sudo secilc "${args[@]}" -o politica-plat.bin -f /dev/null > log-plat.txt 2>&1; then
+            echo "so a plataforma do creek: COMPILOU" >> genfs-info.txt
+          else
+            { echo "so a plataforma do creek: FALHOU"; head -8 log-plat.txt; } >> genfs-info.txt
+          fi
+          mapfile -t args2 < args-compilacao.txt
+          sudo secilc -vv "${args2[@]}" -o politica-v.bin -f /dev/null > log-verboso.txt 2>&1 || true
+          tail -30 log-verboso.txt | cut -c1-200 > log-verboso-fim.txt
+          cat genfs-info.txt
+          cat log-verboso-fim.txt
 
       - name: Relatorio
         run: |
@@ -196,5 +231,15 @@ jobs:
             echo "### Resultado (secilc)"
             echo '```'
             cat resultado.txt
+            echo '```'
+            echo ""
+            echo "### Investigacao do genfscon"
+            echo '```'
+            cat genfs-info.txt
+            echo '```'
+            echo ""
+            echo "### Log verboso do secilc (final)"
+            echo '```'
+            cat log-verboso-fim.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
