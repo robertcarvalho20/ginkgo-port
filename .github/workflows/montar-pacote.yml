@@ -12,10 +12,15 @@ on:
         required: true
         default: "1zETh1vs-MbizeUNVwYNW3IJKLjW6jWhb"
         type: string
-      vendor_sdk:
-        description: "SDK que o vendor declara (37 = mantem como esta)"
+      miui_path:
+        description: "Caminho do zip recovery da MIUI 12.5 EEA no CDN da Xiaomi (de onde vem a politica SELinux original)"
         required: true
-        default: "37"
+        default: "V12.5.12.0.RCOEUXM/miui_GINKGOEEAGlobal_V12.5.12.0.RCOEUXM_f9fdc6c783_11.0.zip"
+        type: string
+      vendor_sdk:
+        description: "SDK que o vendor declara (36 = Android 16; 37 = mantem como o GSI)"
+        required: true
+        default: "36"
         type: string
 
 jobs:
@@ -26,6 +31,7 @@ jobs:
       ROM_URL: ${{ inputs.rom_url }}
       DRIVE_ID: ${{ inputs.drive_id }}
       VENDOR_SDK: ${{ inputs.vendor_sdk }}
+      MIUI_PATH: ${{ inputs.miui_path }}
     steps:
       - name: Liberar espaco no runner
         run: |
@@ -35,8 +41,8 @@ jobs:
       - name: Instalar ferramentas
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq aria2 erofs-utils zip unzip e2fsprogs android-sdk-libsparse-utils python3-pip git lz4 cpio file binutils
-          pip install --break-system-packages gdown
+          sudo apt-get install -y -qq aria2 erofs-utils zip unzip e2fsprogs android-sdk-libsparse-utils python3-pip git lz4 cpio file binutils brotli attr secilc
+          pip install --break-system-packages gdown remotezip
           go install github.com/ssut/payload-dumper-go@latest
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
           git clone --depth 1 https://android.googlesource.com/platform/system/tools/mkbootimg tools
@@ -74,6 +80,93 @@ jobs:
           done
           rm -f out/*.img
           sudo du -sm tree/*
+
+      - name: Preparar a politica SELinux do vendor original (MIUI 12.5)
+        timeout-minutes: 45
+        run: |
+          : > espelhos.txt
+          for host in cdnorg.d.miui.com hugeota.d.miui.com ultimateota.d.miui.com bkt-sgp-miui-ota-update-alisgp.oss-ap-southeast-1.aliyuncs.com bigota.d.miui.com; do
+            r=$(curl -s -L -r 0-4194303 -o /dev/null --max-time 25 -w '%{http_code} %{speed_download}' "https://$host/$MIUI_PATH" || true)
+            echo "$host $r" | tee -a espelhos.txt
+          done
+          host=$(awk '($2==206||$2==200) && $3>=1000000 {print $1; exit}' espelhos.txt)
+          if [ -z "$host" ]; then
+            host=$(awk '($2==206||$2==200) {print $1; exit}' espelhos.txt)
+          fi
+          if [ -z "$host" ]; then
+            echo "ERRO: nenhum espelho tem o arquivo da MIUI: $MIUI_PATH"
+            exit 1
+          fi
+          MIUI_URL_OK="https://$host/$MIUI_PATH"
+          echo "usando: $MIUI_URL_OK"
+          cd work
+          if ! timeout 900 remotezip "$MIUI_URL_OK" vendor.new.dat.br vendor.transfer.list; then
+            echo "remotezip falhou; baixando o zip inteiro (limite de 25 min)"
+            timeout 1500 aria2c -x 16 -s 16 -k 8M --file-allocation=none \
+              --max-tries=3 --retry-wait=5 --timeout=60 --connect-timeout=30 \
+              --summary-interval=60 --console-log-level=warn \
+              -o miui.zip "$MIUI_URL_OK"
+            unzip -o miui.zip vendor.new.dat.br vendor.transfer.list
+            rm -f miui.zip
+          fi
+          brotli -d vendor.new.dat.br -o vendor.new.dat
+          curl -sL https://raw.githubusercontent.com/xpirt/sdat2img/master/sdat2img.py -o sdat2img.py
+          python3 sdat2img.py vendor.transfer.list vendor.new.dat vendor-orig.img
+          rm -f vendor.new.dat vendor.new.dat.br
+          mkdir -p ../osel omnt
+          sudo mount -o loop,ro vendor-orig.img omnt
+          sudo cp -r omnt/etc/selinux/. ../osel/
+          sudo umount omnt
+          rm -f vendor-orig.img
+          cd ..
+          sudo chown -R "$(id -u):$(id -g)" osel
+          VER=$(tr -d '\n ' < osel/plat_sepolicy_vers.txt)
+          SYS=tree/system/system/etc/selinux
+          SE=tree/system_ext/etc/selinux
+          PR=tree/product/etc/selinux
+          cp osel/vendor_sepolicy.cil vendor_fixed.cil
+          GENFS=$(sudo find "$SYS" "$SE" "$PR" -maxdepth 1 -name '*genfs*.cil' | sort)
+          {
+            echo "versao da politica do vendor original: $VER"
+            echo "arquivos genfs da plataforma incluidos:"
+            echo "$GENFS"
+            echo ""
+          } > genfs-fix.txt
+          for i in 1 2 3 4 5 6; do
+            args=(-m -M true -G -N -c 30 "$SYS/plat_sepolicy.cil")
+            for f in "$SYS/mapping/$VER.cil" "$SYS/mapping/$VER.compat.cil" "$SE/system_ext_sepolicy.cil" "$SE/mapping/$VER.cil" "$SE/mapping/$VER.compat.cil" "$PR/product_sepolicy.cil" "$PR/mapping/$VER.cil" "$PR/mapping/$VER.compat.cil" $GENFS osel/plat_pub_versioned.cil vendor_fixed.cil osel/odm_sepolicy.cil; do
+              if sudo test -f "$f"; then args+=("$f"); fi
+            done
+            if sudo secilc -vv "${args[@]}" -o politica-fix.bin -f /dev/null > log-fix.txt 2>&1; then
+              echo "rodada $i: COMPILOU" >> genfs-fix.txt
+              ls -l politica-fix.bin >> genfs-fix.txt
+              break
+            fi
+            echo "rodada $i: FALHOU" >> genfs-fix.txt
+            linhas=$(awk '/Found conflicting genfscon/ {c=1; n=0; next} c && /^[ ]*at / {print $2; n++; if (n==2) {c=0}}' log-fix.txt | grep 'vendor_fixed.cil' | cut -d: -f2 | sort -nu | tr '\n' ' ')
+            if [ -z "$linhas" ]; then
+              echo "nenhum conflito de genfscon do vendor para remover; fim do log:" >> genfs-fix.txt
+              tail -14 log-fix.txt | cut -c1-200 >> genfs-fix.txt
+              break
+            fi
+            echo "removendo do vendor as linhas: $linhas" >> genfs-fix.txt
+            for n in $linhas; do
+              sed -n "${n}p" vendor_fixed.cil | cut -c1-200 >> genfs-fix.txt
+            done
+            script=""
+            for n in $linhas; do script="$script -e ${n}d"; done
+            sed -i $script vendor_fixed.cil
+          done
+          cat genfs-fix.txt
+          if ! grep -q "COMPILOU" genfs-fix.txt; then
+            echo "ERRO: a politica nao compila; o pacote nao seria bootavel."
+            exit 1
+          fi
+          mkdir -p osel_fixed
+          cp -r osel/. osel_fixed/
+          cp vendor_fixed.cil osel_fixed/vendor_sepolicy.cil
+          rm -f osel_fixed/precompiled_sepolicy*
+          ls -l osel_fixed
 
       - name: Remover os apps escolhidos
         run: |
@@ -181,6 +274,24 @@ jobs:
             mv v/vendor.raw v/vendor.img
           fi
           sudo mount -o loop,rw v/vendor.img mnt
+          D=mnt/etc/selinux
+          ctx=$(sudo getfattr --only-values -n security.selinux "$D/plat_sepolicy_vers.txt" 2>/dev/null | tr -d '\0' || true)
+          for f in $(sudo ls "$D"); do
+            if [ ! -e "../osel_fixed/$f" ]; then
+              sudo rm -rf "$D/$f"
+            fi
+          done
+          for f in $(ls ../osel_fixed); do
+            if sudo test -e "$D/$f"; then
+              sudo sh -c "cat '../osel_fixed/$f' > '$D/$f'"
+            else
+              sudo cp "../osel_fixed/$f" "$D/$f"
+              if [ -n "$ctx" ]; then
+                sudo setfattr -n security.selinux -v "$ctx" "$D/$f" || true
+              fi
+            fi
+          done
+          sudo ls -l "$D" > ../vendor-selinux-lista.txt
           if [ "$VENDOR_SDK" != "37" ]; then
             for p in mnt/build.prop mnt/etc/build.prop; do
               if sudo test -f "$p"; then
@@ -351,6 +462,21 @@ jobs:
             echo "### Apps removidos"
             echo '```'
             cat removidos.txt
+            echo '```'
+            echo ""
+            echo "### Espelhos da MIUI testados"
+            echo '```'
+            cat espelhos.txt
+            echo '```'
+            echo ""
+            echo "### Politica SELinux do vendor original (conflitos de genfscon removidos)"
+            echo '```'
+            cat genfs-fix.txt
+            echo '```'
+            echo ""
+            echo "### Arquivos de SELinux gravados no vendor"
+            echo '```'
+            cat vendor-selinux-lista.txt
             echo '```'
             echo ""
             echo "### fstab do vendor (linhas alteradas)"
