@@ -201,6 +201,46 @@ jobs:
           cat genfs-info.txt
           cat log-verboso-fim.txt
 
+      - name: Corrigir os conflitos de genfscon e recompilar
+        run: |
+          VER=$(cat versao-original.txt)
+          SYS=tree/system/system/etc/selinux
+          SE=tree/system_ext/etc/selinux
+          PR=tree/product/etc/selinux
+          cp osel/vendor_sepolicy.cil vendor_fixed.cil
+          GENFS=$(sudo find "$SYS" "$SE" "$PR" -maxdepth 1 -name '*genfs*.cil' | sort)
+          {
+            echo "arquivos genfs da plataforma incluidos:"
+            echo "$GENFS"
+            echo ""
+          } > genfs-fix.txt
+          for i in 1 2 3 4 5 6; do
+            args=(-m -M true -G -N -c 30 "$SYS/plat_sepolicy.cil")
+            for f in "$SYS/mapping/$VER.cil" "$SYS/mapping/$VER.compat.cil" "$SE/system_ext_sepolicy.cil" "$SE/mapping/$VER.cil" "$SE/mapping/$VER.compat.cil" "$PR/product_sepolicy.cil" "$PR/mapping/$VER.cil" "$PR/mapping/$VER.compat.cil" $GENFS osel/plat_pub_versioned.cil vendor_fixed.cil osel/odm_sepolicy.cil; do
+              if sudo test -f "$f"; then args+=("$f"); fi
+            done
+            if sudo secilc -vv "${args[@]}" -o politica-fix.bin -f /dev/null > log-fix.txt 2>&1; then
+              echo "rodada $i: COMPILOU" >> genfs-fix.txt
+              ls -l politica-fix.bin >> genfs-fix.txt
+              break
+            fi
+            echo "rodada $i: FALHOU" >> genfs-fix.txt
+            linhas=$(awk '/Found conflicting genfscon/ {c=1; n=0; next} c && /^[ ]*at / {print $2; n++; if (n==2) {c=0}}' log-fix.txt | grep 'vendor_fixed.cil' | cut -d: -f2 | sort -nu | tr '\n' ' ')
+            if [ -z "$linhas" ]; then
+              echo "nenhum conflito de genfscon do vendor para remover; fim do log:" >> genfs-fix.txt
+              tail -14 log-fix.txt | cut -c1-200 >> genfs-fix.txt
+              break
+            fi
+            echo "removendo do vendor as linhas: $linhas" >> genfs-fix.txt
+            for n in $linhas; do
+              sed -n "${n}p" vendor_fixed.cil | cut -c1-200 >> genfs-fix.txt
+            done
+            script=""
+            for n in $linhas; do script="$script -e ${n}d"; done
+            sed -i $script vendor_fixed.cil
+          done
+          cat genfs-fix.txt
+
       - name: Relatorio
         run: |
           {
@@ -236,6 +276,11 @@ jobs:
             echo "### Investigacao do genfscon"
             echo '```'
             cat genfs-info.txt
+            echo '```'
+            echo ""
+            echo "### Correcao automatica dos conflitos de genfscon"
+            echo '```'
+            cat genfs-fix.txt
             echo '```'
             echo ""
             echo "### Log verboso do secilc (final)"
